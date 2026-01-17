@@ -1,0 +1,14 @@
+name "ddhttpd"
+description "Small HTTP Daemon using libmicrohttpd"
+authors "dd86k <dd@dax.moe>"
+copyright "Copyright © 2025, dd86k <dd@dax.moe>"
+license "BSL-1.0"
+
+dependency "bindbc-libmicrohttpd" repository="git+https://github.com/dd86k/bindbc-libmicrohttpd.git" version="6b020176185e32b1a95be843698880de67181ae0"
+
+subPackage {
+	name "example-basic"
+	targetType "executable"
+	sourceFiles "examples/basic.d"
+	dependency "bindbc-libmicrohttpd" version="*"
+}
