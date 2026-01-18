@@ -2,7 +2,7 @@ module ddhttpd.server;
 
 import bindbc.libmicrohttpd;
 import bindbc.loader;
-import std.string : toStringz, fromStringz;
+import std.string : toStringz, fromStringz, indexOf;
 import std.stdio;
 import std.conv : text;
 import std.encoding;
@@ -60,46 +60,19 @@ class HttpServerException : Exception
     string method;
 }
 
-private
-void libmicrohttpd_load()
-{
-    __gshared LibMicroHTTPDSupport support;
-    
-    // Already loaded
-    if (support > LibMicroHTTPDSupport.badLibrary)
-        return;
-    
-    support = loadLibMicroHTTPD();
-    switch (support) with (LibMicroHTTPDSupport)
-    {
-        // No library found
-        case LibMicroHTTPDSupport.noLibrary:
-            foreach (const(ErrorInfo) err; errors)
-            {
-                throw new Exception(cast(string)fromStringz(err.error));
-            }
-            break;
-        // Version loaded is missing symbols
-        case LibMicroHTTPDSupport.badLibrary:
-            foreach (const(ErrorInfo) err; errors)
-            {
-                // err.message should contain symbol
-                throw new Exception(cast(string)fromStringz(err.error));
-            }
-            break;
-        default:
-    }
-}
-
 struct HTTPRequest
 {
-    string path;
     string method;
+    string path;
     ubyte[] payload;
+    /// URL parameters
+    string[string] params;
     
-    this(MHD_Connection *conn)
+    this(MHD_Connection *conn, string method_, string path_)
     {
         connection = conn;
+        method = method_;
+        path = path_;
     }
     
     void reply(int code, inout(void)[] content, inout(string) contentType, int mode = MHD_RESPMEM_PERSISTENT)
@@ -126,6 +99,7 @@ struct HTTPRequest
         MHD_destroy_response(response);
     }
     
+    /// GET parameter
     string param(string key)
     {
         const(char)* value = MHD_lookup_connection_value(
@@ -141,27 +115,7 @@ private:
     MHD_Connection *connection;
 }
 
-// TODO: struct URLMatcher (or similar) to help return Routes
-
-private
-struct Route
-{
-    string method;
-    string path;
-    int delegate(ref HTTPRequest) handler;
-}
-
-private
-struct ServerState
-{
-    MHD_Daemon *daemon;
-    // TODO: Change [string][string] to Path structure
-    //       Path{method,url} or something else
-    Route[string][string] routes;
-    int delegate(ref HTTPRequest, Exception) on_error_exception;
-}
-
-// TODO: Mutex when adding/removing paths
+// TODO: Mutex when adding/removing paths?
 class HTTPServer
 {
     this()
@@ -191,7 +145,13 @@ class HTTPServer
         if (!handler)
             throw new Exception("Need handler function");
         
-        state.routes.update(path,
+        if (indexOf(path, ':') >= 0)
+        {
+            state.pattern_routes ~= PathPattern(method, path, handler);
+            return this;
+        }
+        
+        state.exact_routes.update(path,
             {
                 Route[string] routes;
                 routes[method] = Route(method, path, handler);
@@ -248,8 +208,59 @@ private:
     ServerState state;
 }
 
+//
+// Private functions
+//
+
+private:
+
+/// A single url path route
+struct Route
+{
+    string method;
+    string path;
+    int delegate(ref HTTPRequest) handler;
+}
+
+struct ServerState
+{
+    MHD_Daemon *daemon;
+    Route[string][string] exact_routes;
+    PathPattern[] pattern_routes;
+    int delegate(ref HTTPRequest, Exception) on_error_exception;
+}
+
+void libmicrohttpd_load()
+{
+    __gshared LibMicroHTTPDSupport support;
+    
+    // Already loaded
+    if (support > LibMicroHTTPDSupport.badLibrary)
+        return;
+    
+    support = loadLibMicroHTTPD();
+    switch (support) with (LibMicroHTTPDSupport)
+    {
+        // No library found
+        case LibMicroHTTPDSupport.noLibrary:
+            foreach (const(ErrorInfo) err; errors)
+            {
+                throw new Exception(cast(string)fromStringz(err.error));
+            }
+            break;
+        // Version loaded is missing symbols
+        case LibMicroHTTPDSupport.badLibrary:
+            foreach (const(ErrorInfo) err; errors)
+            {
+                // err.message should contain symbol
+                throw new Exception(cast(string)fromStringz(err.error));
+            }
+            break;
+        default:
+    }
+}
+
 // TODO: Headers
-private
 extern (C)
 MHD_Result ddhttpd_handler(void *cls,
     MHD_Connection *connection,
@@ -260,9 +271,11 @@ MHD_Result ddhttpd_handler(void *cls,
     size_t *upload_data_size,
     void **ptr)
 {
-    HTTPRequest req = HTTPRequest(connection);
-    req.path        = fromStringz(url).idup;
-    req.method      = fromStringz(method).idup;
+    HTTPRequest req = HTTPRequest(
+        connection,
+        fromStringz(method).idup,
+        fromStringz(url).idup
+    );
     
     // TODO: Better upload data handling
     //       *ptr is typically used to track connection state across multiple calls for POST data.
@@ -277,26 +290,18 @@ MHD_Result ddhttpd_handler(void *cls,
     
     try
     {
-        if (state.routes is null)
+        if (state.exact_routes)
+            if (Route[string] *routes = req.path in state.exact_routes)
+                if (Route *route = req.method in *routes)
+                    return route.handler(req);
+        
+        foreach (route; state.pattern_routes)
         {
-            throw new HttpServerException(HTTPStatus.notFound, HTTPMsg.notFound, req);
+            if (req.method == route.method && route.match(req.path, req.params))
+                return route.handler(req);
         }
         
-        // Get route by path
-        Route[string] *routes = req.path in state.routes;
-        if (routes == null)
-        {
-            throw new HttpServerException(HTTPStatus.notFound, HTTPMsg.notFound, req);
-        }
-        
-        // Get route by method
-        Route *route = req.method in *routes;
-        if (route == null)
-        {
-            throw new HttpServerException(HTTPStatus.methodNotAllowed, HTTPMsg.methodNotAllowed, req);
-        }
-        
-        return route.handler(req);
+        throw new HttpServerException(HTTPStatus.notFound, HTTPMsg.notFound, req);
     }
     catch (Exception ex)
     {
@@ -325,21 +330,86 @@ MHD_Result ddhttpd_handler(void *cls,
     }
 }
 
-string escapeHtml(string text)
+struct PathPattern
 {
-    import std.array : appender;
-    auto result = appender!string;
-    foreach (char c; text)
+    string[] segments;      // ["user", ":id", "posts"]
+    bool[] isParam;         // [false, true, false]
+    string[] paramNames;    // ["id"]
+    string method;
+    int delegate(ref HTTPRequest) handler;
+    
+    this(string method_, string pattern, int delegate(ref HTTPRequest) handler_)
     {
-        switch (c)
+        method = method_;
+        handler = handler_;
+        
+        if (pattern.length && pattern[0] == '/')
+            pattern = pattern[1..$];
+        
+        import std.algorithm.iteration : splitter;
+        import std.array : split;
+        
+        foreach (part; splitter(pattern, '/'))
         {
-            case '<':  result.put("&lt;");   break;
-            case '>':  result.put("&gt;");   break;
-            case '&':  result.put("&amp;");  break;
-            case '"':  result.put("&quot;"); break;
-            case '\'': result.put("&#39;");  break;
-            default:   result.put(c);        break;
+            if (part.length && part[0] == ':')
+            {
+                isParam ~= true;
+                paramNames ~= part[1..$];  // Remove ':'
+                segments   ~= part[1..$];
+            }
+            else
+            {
+                isParam  ~= false;
+                segments ~= part;
+            }
         }
     }
-    return result.data;
+    
+    // Match incoming path and extract parameters
+    bool match(string path, out string[string] params)
+    {
+        if (path.length && path[0] == '/')
+            path = path[1..$];
+        
+        import std.array : split;
+        
+        string[] parts = path.split('/');
+        
+        // Segment count must match
+        if (parts.length != segments.length)
+            return false;
+        
+        foreach (i, segment; segments)
+        {
+            if (isParam[i])
+            {
+                // Capture parameter value
+                params[segment] = parts[i];
+            }
+            else
+            {
+                // Must match exactly
+                if (parts[i] != segment)
+                    return false;
+            }
+        }
+        
+        return true;
+    }
+}
+unittest
+{
+    PathPattern pattern = PathPattern(null, "/user/:id/posts/:postId", null);
+    
+    string[string] params;
+    
+    // Should match
+    assert(pattern.match("/user/123/posts/456", params));
+    assert(params["id"] == "123");
+    assert(params["postId"] == "456");
+    
+    // Should not match
+    params.clear();
+    assert(!pattern.match("/user/123/comments/456", params));
+    assert(!pattern.match("/user/123", params));
 }
