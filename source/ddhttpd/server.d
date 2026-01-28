@@ -7,8 +7,21 @@ import std.stdio;
 import std.conv : text;
 import std.encoding;
 
+// This stuff is better in connection handling... Oh well
+
+/// Request ok.
 alias REQUEST_OK     = MHD_YES;
+/// Request not ok to MHD.
 alias REQUEST_REFUSE = MHD_NO;
+
+// Start flags
+
+/// Print MHD debug messages to a file (if set) or stderr.
+alias START_DEBUG      = MHD_USE_DEBUG;
+/// Use IPv4 and IPv6.
+alias START_DUAL_STACK = MHD_USE_DUAL_STACK;
+/// Use IPv6
+alias START_IPV6       = MHD_USE_IPv6;
 
 enum ContentType
 {
@@ -38,6 +51,7 @@ enum HTTPStatus
     notFound = 404,
     methodNotAllowed = 405,
 }
+// NOTE: Uh, we can just use MHD_get_reason_phrase_for, but this is fine too.
 enum HTTPMsg
 {
     ok = "OK",
@@ -71,6 +85,7 @@ struct HTTPRequest
     /// URL parameters
     string[string] params;
     
+    // Constructed by this module on a new connection
     this(MHD_Connection *conn, string method_, string path_)
     {
         connection = conn;
@@ -78,7 +93,12 @@ struct HTTPRequest
         path = path_;
     }
     
-    void reply(int code, inout(void)[] content, inout(string) contentType, int mode = MHD_RESPMEM_PERSISTENT)
+    // HACK: mode is a hack
+    //       Need to do a "createReplyXYZ" that returns a struct to "properly" reply
+    //       using appropriate strategy.
+    //       This function specifically could be renamed to something else
+    // Reply
+    void reply(int http_code, inout(void)[] content, inout(string) contentType, int mode = MHD_RESPMEM_PERSISTENT)
     {
         // MHD_RESPMEM_PERSISTENT
         // MHD_RESPMEM_MUST_FREE
@@ -95,7 +115,7 @@ struct HTTPRequest
         if (result == MHD_NO)
             throw new MHDException("MHD_add_response_header");
 
-        result = MHD_queue_response(connection, code, response);
+        result = MHD_queue_response(connection, http_code, response);
         if (result == MHD_NO)
             throw new MHDException("MHD_queue_response");
         
@@ -118,7 +138,6 @@ private:
     MHD_Connection *connection;
 }
 
-// TODO: Mutex when adding/removing paths?
 class HTTPServer
 {
     this()
@@ -179,30 +198,30 @@ class HTTPServer
     }
     
     // Start daemon mode
-    void start(ushort port)
+    void start(ushort port, int flags = 0)
     {
         version (linux)
-            enum FLAGS =
+            enum DEFAULT_FLAGS =
                 MHD_USE_TCP_FASTOPEN | // >=3.6
                 MHD_USE_INTERNAL_POLLING_THREAD |
-                MHD_USE_POLL |
-                MHD_USE_DEBUG;
+                MHD_USE_POLL;
         else
-            enum FLAGS = 
+            enum DEFAULT_FLAGS = 
                 MHD_USE_INTERNAL_POLLING_THREAD |
-                MHD_USE_POLL |
-                MHD_USE_DEBUG;
+                MHD_USE_POLL;
         
         if (state.daemon)
             throw new Exception("Already started");
         
+        flags |= DEFAULT_FLAGS;
+        
         state.daemon = MHD_start_daemon(
-            FLAGS, port,
+            flags, port,
             null, null,
             &ddhttpd_handler, &state,
-                MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,
-                MHD_OPTION_STRICT_FOR_CLIENT, 0,
-                MHD_OPTION_END);
+            MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,  // Allows address reuse
+            MHD_OPTION_STRICT_FOR_CLIENT, 0,        // Recommended be OFF in production
+            MHD_OPTION_END);
         if (state.daemon == null)
             throw new MHDException("MHD_start_daemon");
     }
