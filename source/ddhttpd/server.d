@@ -21,7 +21,10 @@ class MHDException : Exception
     this(string funcname,
         size_t line = __LINE__, string file = __FILE__)
     {
-        super(text(funcname, ": failed"), file, line);
+        import core.stdc.errno : errno;
+        import core.stdc.string : strerror;
+        import std.string : fromStringz;
+        super(text(funcname, ": ", fromStringz(strerror(errno))), file, line);
     }
 }
 
