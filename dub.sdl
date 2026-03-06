@@ -12,3 +12,10 @@ subPackage {
 	sourceFiles "examples/basic.d"
 	dependency "bindbc-libmicrohttpd" version="*"
 }
+
+subPackage {
+	name "test-integration"
+	targetType "executable"
+	sourceFiles "tests/integration.d"
+	dependency "ddhttpd" version="*"
+}
