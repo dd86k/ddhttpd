@@ -2,12 +2,11 @@ module ddhttpd.server;
 
 import bindbc.libmicrohttpd;
 import bindbc.loader;
-import std.string : toStringz, fromStringz, indexOf;
-import std.stdio;
+import core.memory : GC; // to help manage post/put uploads
 import std.conv : text;
 import std.encoding;
-
-// This stuff is better in connection handling... Oh well
+import std.stdio;
+import std.string : toStringz, fromStringz, indexOf;
 
 /// Request ok.
 alias REQUEST_OK     = MHD_YES;
@@ -50,6 +49,7 @@ enum HTTPStatus
     badRequest = 400,
     notFound = 404,
     methodNotAllowed = 405,
+    payloadTooLarge = 413,
 }
 // NOTE: Uh, we can just use MHD_get_reason_phrase_for, but this is fine too.
 enum HTTPMsg
@@ -58,6 +58,7 @@ enum HTTPMsg
     badRequest = "Bad Request",
     notFound = "Not Found",
     methodNotAllowed = "Method Not Allowed",
+    payloadTooLarge = "Content Too Large",
 }
 
 class HttpServerException : Exception
@@ -335,6 +336,13 @@ class HTTPServer
         return this;
     }
     
+    /// Set the maximum allowed upload body size in bytes. 0 means unlimited.
+    typeof(this) maxUploadSize(size_t limit)
+    {
+        state.max_upload_size = limit;
+        return this;
+    }
+
     // Add a route
     typeof(this) addRoute(string method, string path, int delegate(ref HTTPRequest) handler)
     {
@@ -441,6 +449,14 @@ struct ServerState
     Route[string][string] exact_routes;
     PathPattern[] pattern_routes;
     int delegate(ref HTTPRequest, Exception) on_error_exception;
+    size_t max_upload_size;
+}
+
+/// Per-request state for accumulating upload data across MHD callbacks.
+struct ConnectionData
+{
+    ubyte[] payload;
+    bool upload_too_large;
 }
 
 void libmicrohttpd_load()
@@ -483,36 +499,82 @@ MHD_Result ddhttpd_handler(void *cls,
     size_t *upload_data_size,
     void **ptr)
 {
+    // First call for this request — initialize connection state.
+    // MHD calls the handler multiple times per request: once to signal
+    // a new request, then for each chunk of upload data, then a final
+    // call with upload_data_size == 0 when all data has been received.
+    if (*ptr is null)
+    {
+        ConnectionData *cd = new ConnectionData();
+        GC.addRoot(cast(void*)cd);
+        *ptr = cast(void*)cd;
+        return MHD_YES;
+    }
+
+    ConnectionData *cd = cast(ConnectionData*)*ptr;
+    ServerState *state = cast(ServerState*)cls;
+    assert(state, "server state is NULL");
+
+    // Accumulate upload data (POST/PUT body chunks)
+    if (*upload_data_size > 0)
+    {
+        if (!cd.upload_too_large)
+        {
+            if (state.max_upload_size > 0 &&
+                cd.payload.length + *upload_data_size > state.max_upload_size)
+            {
+                // Mark as too large — stop buffering but keep consuming
+                // so MHD can finish receiving. Response is sent on final call.
+                cd.upload_too_large = true;
+                cd.payload = null;
+            }
+            else
+            {
+                cd.payload ~= (cast(ubyte*)upload_data)[0..*upload_data_size];
+            }
+        }
+        *upload_data_size = 0;
+        return MHD_YES;
+    }
+
+    // Final call — all upload data received, dispatch to route handler.
+    scope(exit)
+    {
+        GC.removeRoot(cast(void*)cd);
+        *ptr = null;
+    }
+
+    // Upload exceeded the configured limit — reject without dispatching.
+    if (cd.upload_too_large)
+    {
+        // TODO: Could be interesting to hook a custom 413 handler eventually, if needed
+        MHD_Response *response = MHD_create_response_from_buffer(
+            0, null, MHD_RESPMEM_PERSISTENT);
+        MHD_queue_response(connection, HTTPStatus.payloadTooLarge, response);
+        MHD_destroy_response(response);
+        return MHD_YES;
+    }
+
     HTTPRequest req = HTTPRequest(
         connection,
         fromStringz(method).idup,
         fromStringz(url).idup
     );
-    
-    // TODO: Better upload data handling
-    //       *ptr is typically used to track connection state across multiple calls for POST data.
-    //       Should it be tackled before path/method handling if reentering?
-    if (upload_data_size)
-    {
-        req.payload = (cast(ubyte*)upload_data)[0..*upload_data_size];
-    }
-    
-    ServerState *state = cast(ServerState*)cls;
-    assert(state, "server state is NULL");
-    
+    req.payload = cd.payload;
+
     try
     {
         if (state.exact_routes)
             if (Route[string] *routes = req.path in state.exact_routes)
                 if (Route *route = req.method in *routes)
                     return route.handler(req);
-        
+
         foreach (route; state.pattern_routes)
         {
             if (req.method == route.method && route.match(req.path, req.params))
                 return route.handler(req);
         }
-        
+
         throw new HttpServerException(HTTPStatus.notFound, HTTPMsg.notFound, req);
     }
     catch (Exception ex)
