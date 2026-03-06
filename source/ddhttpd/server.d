@@ -153,10 +153,17 @@ struct HTTPReply
         length += data.length;
     }
 
+    void put(char c)
+    {
+        ensurecap(1);
+        buffer[length] = c;
+        length += 1;
+    }
+
     void writef(Args...)(string fmt, Args args)
     {
         import std.format : formattedWrite;
-        formattedWrite(&put, fmt, args);
+        formattedWrite(this, fmt, args);
     }
 
     const(char)[] opSlice()
