@@ -152,6 +152,12 @@ struct HTTPReply
         length += data.length;
     }
 
+    void writef(Args...)(string fmt, Args args)
+    {
+        import std.format : formattedWrite;
+        formattedWrite(&put, fmt, args);
+    }
+
     const(char)[] opSlice()
     {
         return buffer[0 .. length];
@@ -221,6 +227,16 @@ unittest
     assert(reply.capacity >= 4096);
     assert(reply.size == 3);
     assert(reply[] == "abc");
+}
+unittest
+{
+    // writef
+    HTTPReply reply = HTTPReply.create(64);
+    reply.writef("Hello, %s! You are %d years old.", "Alice", 30);
+    assert(reply[] == "Hello, Alice! You are 30 years old.");
+
+    reply.writef(" Score: %0.1f", 9.5);
+    assert(reply[] == "Hello, Alice! You are 30 years old. Score: 9.5");
 }
 unittest
 {
