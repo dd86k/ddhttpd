@@ -368,6 +368,17 @@ class HTTPServer
         return this;
     }
     
+    /// Get the port the server is listening on (useful when started with port 0).
+    ushort port()
+    {
+        if (!state.daemon)
+            throw new Exception("Server not started");
+        const(MHD_DaemonInfo)* info = MHD_get_daemon_info(state.daemon, MHD_DAEMON_INFO_BIND_PORT);
+        if (info == null)
+            throw new MHDException("MHD_get_daemon_info");
+        return info.port;
+    }
+
     void stop()
     {
         if (state.daemon)
