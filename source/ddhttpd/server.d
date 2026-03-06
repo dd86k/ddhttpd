@@ -401,6 +401,14 @@ class HTTPServer
         return this;
     }
 
+    /// Set the number of threads in MHD's internal thread pool.
+    /// Must be called before start(). Default is 0 (single thread).
+    typeof(this) threadPoolSize(uint size)
+    {
+        state.thread_pool_size = size;
+        return this;
+    }
+
     // Add a route
     typeof(this) addRoute(string method, string path, int delegate(ref HTTPRequest) handler)
     {
@@ -522,8 +530,9 @@ class HTTPServer
             flags, port,
             null, null,
             &ddhttpd_handler, &state,
-            MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,  // Allows address reuse
-            MHD_OPTION_STRICT_FOR_CLIENT, 0,        // Recommended be OFF in production
+            MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,
+            MHD_OPTION_STRICT_FOR_CLIENT, 0,
+            MHD_OPTION_THREAD_POOL_SIZE, state.thread_pool_size,
             MHD_OPTION_END);
         if (state.daemon == null)
             throw new MHDException("MHD_start_daemon");
@@ -554,6 +563,7 @@ struct ServerState
     PathPattern[] pattern_routes;
     int delegate(ref HTTPRequest, Exception) on_error_exception;
     size_t max_upload_size;
+    uint thread_pool_size;
 }
 
 /// Per-request state for accumulating upload data across MHD callbacks.
