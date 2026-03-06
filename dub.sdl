@@ -4,7 +4,25 @@ authors "dd86k <dd@dax.moe>"
 copyright "Copyright © 2025, dd86k <dd@dax.moe>"
 license "BSL-1.0"
 
-dependency "bindbc-libmicrohttpd" repository="git+https://github.com/dd86k/bindbc-libmicrohttpd.git" version="f252544b87a1433dcd94df425044bc4c61e37a18"
+dependency "bindbc-libmicrohttpd" repository="git+https://github.com/dd86k/bindbc-libmicrohttpd.git" version="3ea36df86d65994a75a9f192ec18e5a056e925d9"
+
+configuration "library" {
+	targetType "library"
+}
+
+configuration "staticLibrary" {
+	targetType "staticLibrary"
+}
+
+configuration "sourceLibrary" {
+	targetType "sourceLibrary"
+}
+
+configuration "static-binding" {
+	targetType "library"
+	versions "BindBC_Static"
+	libs "microhttpd"
+}
 
 subPackage {
 	name "example-basic"

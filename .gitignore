@@ -17,3 +17,7 @@ ddhttpd-test-*
 *.lst
 *.json
 *.dll
+
+# Claude
+.claude/
+CLAUDE.md

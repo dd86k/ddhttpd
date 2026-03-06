@@ -1,7 +1,8 @@
 module ddhttpd.server;
 
 import bindbc.libmicrohttpd;
-import bindbc.loader;
+static if (!bindbc.libmicrohttpd.staticBinding)
+    import bindbc.loader;
 import core.memory : GC; // to help manage post/put uploads
 import std.conv : text;
 import std.encoding;
@@ -19,7 +20,7 @@ alias REQUEST_REFUSE = MHD_NO;
 alias START_DEBUG      = MHD_USE_DEBUG;
 /// Use IPv4 and IPv6.
 alias START_DUAL_STACK = MHD_USE_DUAL_STACK;
-/// Use IPv6
+/// Use IPv6 only
 alias START_IPV6       = MHD_USE_IPv6;
 
 enum ContentType
@@ -459,33 +460,40 @@ struct ConnectionData
     bool upload_too_large;
 }
 
-void libmicrohttpd_load()
+static if (bindbc.libmicrohttpd.staticBinding)
 {
-    __gshared LibMicroHTTPDSupport support;
-    
-    // Already loaded
-    if (support > LibMicroHTTPDSupport.badLibrary)
-        return;
-    
-    support = loadLibMicroHTTPD();
-    switch (support) with (LibMicroHTTPDSupport)
+    void libmicrohttpd_load() {} // compiler is free to optimize this out
+}
+else
+{
+    void libmicrohttpd_load()
     {
-        // No library found
-        case LibMicroHTTPDSupport.noLibrary:
-            foreach (const(ErrorInfo) err; errors)
-            {
-                throw new Exception(cast(string)fromStringz(err.error));
-            }
-            break;
-        // Version loaded is missing symbols
-        case LibMicroHTTPDSupport.badLibrary:
-            foreach (const(ErrorInfo) err; errors)
-            {
-                // err.message should contain symbol
-                throw new Exception(cast(string)fromStringz(err.error));
-            }
-            break;
-        default:
+        __gshared LibMicroHTTPDSupport support;
+
+        // Already loaded
+        if (support > LibMicroHTTPDSupport.badLibrary)
+            return;
+
+        support = loadLibMicroHTTPD();
+        switch (support) with (LibMicroHTTPDSupport)
+        {
+            // No library found
+            case LibMicroHTTPDSupport.noLibrary:
+                foreach (const(ErrorInfo) err; errors)
+                {
+                    throw new Exception(cast(string)fromStringz(err.error));
+                }
+                break;
+            // Version loaded is missing symbols
+            case LibMicroHTTPDSupport.badLibrary:
+                foreach (const(ErrorInfo) err; errors)
+                {
+                    // err.message should contain symbol
+                    throw new Exception(cast(string)fromStringz(err.error));
+                }
+                break;
+            default:
+        }
     }
 }
 
