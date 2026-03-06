@@ -4,6 +4,8 @@ import bindbc.libmicrohttpd;
 static if (!bindbc.libmicrohttpd.staticBinding)
     import bindbc.loader;
 import core.memory : GC; // to help manage post/put uploads
+import core.thread.osthread : Thread, thread_attachThis;
+import core.thread.threadbase : thread_detachThis;
 import std.conv : text;
 import std.encoding;
 import std.stdio;
@@ -609,7 +611,18 @@ MHD_Result ddhttpd_handler(void *cls,
     size_t *upload_data_size,
     void **ptr)
 {
-    // First call for this request — initialize connection state.
+    // MHD uses its own thread pool: Register foreign threads with
+    // the D runtime so the GC can scan their stacks and collect
+    // allocations made during request handling.
+    bool attached = false;
+    if (Thread.getThis() is null)
+    {
+        thread_attachThis();
+        attached = true;
+    }
+    scope(exit) if (attached) thread_detachThis();
+
+    // First call for this request: Initialize connection state.
     // MHD calls the handler multiple times per request: once to signal
     // a new request, then for each chunk of upload data, then a final
     // call with upload_data_size == 0 when all data has been received.
