@@ -411,6 +411,52 @@ class HTTPServer
         return this;
     }
     
+    typeof(this) get(string path, int delegate(ref HTTPRequest) handler)
+    {
+        return addRoute("GET", path, handler);
+    }
+    
+    typeof(this) head(string path, int delegate(ref HTTPRequest) handler)
+    {
+        return addRoute("HEAD", path, handler);
+    }
+    
+    typeof(this) options(string path, int delegate(ref HTTPRequest) handler)
+    {
+        return addRoute("OPTIONS", path, handler);
+    }
+    
+    typeof(this) trace(string path, int delegate(ref HTTPRequest) handler)
+    {
+        return addRoute("TRACE", path, handler);
+    }
+    
+    typeof(this) put(string path, int delegate(ref HTTPRequest) handler)
+    {
+        return addRoute("PUT", path, handler);
+    }
+    
+    typeof(this) post(string path, int delegate(ref HTTPRequest) handler)
+    {
+        return addRoute("POST", path, handler);
+    }
+    
+    typeof(this) patch(string path, int delegate(ref HTTPRequest) handler)
+    {
+        return addRoute("PATCH", path, handler);
+    }
+    
+    typeof(this) delete_(string path, int delegate(ref HTTPRequest) handler)
+    {
+        return addRoute("DELETE", path, handler);
+    }
+    
+    // Not commonly use at application level
+    typeof(this) connect(string path, int delegate(ref HTTPRequest) handler)
+    {
+        return addRoute("CONNECT", path, handler);
+    }
+    
     /// Get the port the server is listening on (useful when started with port 0).
     ushort port()
     {
