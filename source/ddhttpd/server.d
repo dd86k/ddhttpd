@@ -9,6 +9,9 @@ import std.encoding;
 import std.stdio;
 import std.string : toStringz, fromStringz, indexOf;
 
+/// Printable ddhttpd version
+enum DDHTTPD_VERSION = "0.0.1";
+
 /// Request ok.
 alias REQUEST_OK     = MHD_YES;
 /// Request not ok to MHD.
@@ -23,10 +26,13 @@ alias START_DUAL_STACK = MHD_USE_DUAL_STACK;
 /// Use IPv6 only
 alias START_IPV6       = MHD_USE_IPv6;
 
+// Common Content-Type values
 enum ContentType
 {
     text_html   = "text/html",
     text_plain  = "text/plain",
+    application_json = "application/json",
+    application_xml  = "application/xml",
 }
 
 class MHDException : Exception
