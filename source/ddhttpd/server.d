@@ -262,13 +262,39 @@ struct HTTPRequest
         if (result == MHD_NO)
             throw new MHDException("MHD_add_response_header");
 
+        foreach (h; response_headers)
+        {
+            result = MHD_add_response_header(response, h.key, h.value);
+            if (result == MHD_NO)
+                throw new MHDException("MHD_add_response_header");
+        }
+
         result = MHD_queue_response(connection, http_code, response);
         if (result == MHD_NO)
             throw new MHDException("MHD_queue_response");
 
         MHD_destroy_response(response);
     }
-    
+
+    /// Get a request header value by name. Returns null if not found.
+    string header(string key)
+    {
+        const(char)* value = MHD_lookup_connection_value(
+            connection,
+            MHD_HEADER_KIND,
+            toStringz(key)
+        );
+
+        return value ? cast(string)fromStringz(value) : null;
+    }
+
+    /// Add a response header to be sent with the reply.
+    ref typeof(this) addHeader(const(char)* key, const(char)* value) return
+    {
+        response_headers ~= ResponseHeader(key, value);
+        return this;
+    }
+
     /// GET parameter
     string param(string key)
     {
@@ -283,6 +309,13 @@ struct HTTPRequest
     
 private:
     MHD_Connection *connection;
+    ResponseHeader[] response_headers;
+}
+
+struct ResponseHeader
+{
+    const(char)* key;
+    const(char)* value;
 }
 
 class HTTPServer
@@ -429,7 +462,6 @@ void libmicrohttpd_load()
     }
 }
 
-// TODO: Headers
 extern (C)
 MHD_Result ddhttpd_handler(void *cls,
     MHD_Connection *connection,
