@@ -23,12 +23,12 @@ void main()
     HTTPServer server = new HTTPServer()
         .addRoute(`GET`, `/`, (ref HTTPRequest req)
         {
-            req.reply(200, INDEX, "text/html");
+            req.reply(200, HTTPReply.staticBuffer(INDEX), "text/html");
             return REQUEST_OK;
         })
         .addRoute(`GET`, `/page2`, (ref HTTPRequest req)
         {
-            req.reply(200, PAGE2, "text/html");
+            req.reply(200, HTTPReply.staticBuffer(PAGE2), "text/html");
             return REQUEST_OK;
         })
     ;

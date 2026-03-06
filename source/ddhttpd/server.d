@@ -79,26 +79,54 @@ class HttpServerException : Exception
 
 struct HTTPReply
 {
-    // Init capacity
-    this(size_t init)
+    /// Create a reply that contains dynamically grown data and will be freed
+    /// by MHD, best in most cases.
+    /// MHD: Uses MHD_RESPMEM_MUST_FREE.
+    static HTTPReply create(size_t init = 4096)
     {
         import core.stdc.stdlib : malloc;
-        buffer = cast(char*)malloc(init);
-        if (buffer == null)
+        HTTPReply r;
+        r.buffer = cast(char*)malloc(init);
+        if (r.buffer == null)
             throw new Exception("malloc failed");
-        capacity = init;
+        r.capacity = init;
+        r.mode = MHD_RESPMEM_MUST_FREE;
+        return r;
     }
-    
+
+    /// Create a new reply with persistent static immutable data.
+    /// MHD: Uses MHD_RESPMEM_PERSISTENT.
+    static HTTPReply staticBuffer(inout(void)[] data)
+    {
+        HTTPReply r;
+        r.buffer = cast(char*)data.ptr;
+        r.length = data.length;
+        r.mode = MHD_RESPMEM_PERSISTENT;
+        return r;
+    }
+
+    /// Create a reply with small dynamic data, best for stack/temporary data.
+    /// MHD: Uses MHD_RESPMEM_MUST_COPY.
+    static HTTPReply copyBuffer(const(void)[] data)
+    {
+        HTTPReply r;
+        r.buffer = cast(char*)data.ptr;
+        r.length = data.length;
+        r.mode = MHD_RESPMEM_MUST_COPY;
+        return r;
+    }
+
     void reserve(size_t newcap)
     {
         import core.stdc.stdlib : realloc;
+        assert(mode == MHD_RESPMEM_MUST_FREE, "reserve only valid on dynamic replies");
         char *p = cast(char*)realloc(buffer, newcap);
         if (p == null)
             throw new Exception("realloc failed");
         buffer = p;
         capacity = newcap;
     }
-    
+
     void ensurecap(size_t incoming)
     {
         if (length + incoming <= capacity)
@@ -115,13 +143,13 @@ struct HTTPReply
         buffer[length .. length + data.length] = data[];
         length += data.length;
     }
-    
+
     const(char)[] opSlice()
     {
         return buffer[0 .. length];
     }
 
-    @property size_t size()
+    size_t size()
     {
         return length;
     }
@@ -131,11 +159,16 @@ private:
     char *buffer;
     size_t capacity;
     size_t length;
+    // Modes:
+    // MHD_RESPMEM_PERSISTENT: No free, no copy
+    // MHD_RESPMEM_MUST_FREE : MHD will use free.3
+    // MHD_RESPMEM_MUST_COPY : Copies into internal buffer
+    int mode;
 }
 unittest
 {
-    // Basic construction
-    HTTPReply reply = HTTPReply(128);
+    // Dynamic reply
+    HTTPReply reply = HTTPReply.create(128);
     assert(reply.size == 0);
     assert(reply.capacity >= 128);
 
@@ -154,7 +187,7 @@ unittest
 unittest
 {
     // Growth beyond initial capacity
-    HTTPReply reply = HTTPReply(4);
+    HTTPReply reply = HTTPReply.create(4);
     reply.put("abcdef"); // exceeds initial capacity of 4
     assert(reply.size == 6);
     assert(reply[] == "abcdef");
@@ -162,7 +195,7 @@ unittest
 unittest
 {
     // Multiple puts triggering multiple growths
-    HTTPReply reply = HTTPReply(8);
+    HTTPReply reply = HTTPReply.create(8);
     foreach (i; 0 .. 1000)
         reply.put("x");
     assert(reply.size == 1000);
@@ -174,13 +207,29 @@ unittest
 unittest
 {
     // Reserve explicitly
-    HTTPReply reply = HTTPReply(16);
+    HTTPReply reply = HTTPReply.create(16);
     reply.put("abc");
     reply.reserve(4096);
     assert(reply.capacity >= 4096);
-    // Data survives realloc
     assert(reply.size == 3);
     assert(reply[] == "abc");
+}
+unittest
+{
+    // Static buffer
+    immutable string data = "hello static";
+    HTTPReply reply = HTTPReply.staticBuffer(data);
+    assert(reply.size == 12);
+    assert(reply[] == "hello static");
+}
+unittest
+{
+    // Copy buffer from stack data
+    char[16] stackbuf = 0;
+    stackbuf[0..5] = "stack";
+    HTTPReply reply = HTTPReply.copyBuffer(stackbuf[0..5]);
+    assert(reply.size == 5);
+    assert(reply[] == "stack");
 }
 
 struct HTTPRequest
@@ -191,10 +240,6 @@ struct HTTPRequest
     /// URL parameters
     string[string] params;
     
-    // MHD_RESPMEM_PERSISTENT -> No free, no copy
-    // MHD_RESPMEM_MUST_FREE  -> Frees using free.3
-    // MHD_RESPMEM_MUST_COPY  -> Copies into internal buffer
-    
     // Constructed by this module on a new connection
     this(MHD_Connection *conn, string method_, string path_)
     {
@@ -203,24 +248,16 @@ struct HTTPRequest
         path = path_;
     }
     
-    HTTPReply createReply()
-    {
-        HTTPReply reply = HTTPReply(4096);
-        
-        return reply;
-    }
-    
-    // Reply using HTTPReply
     void reply(int http_code, HTTPReply reply, inout(char) *contentType)
     {
         MHD_Response *response = MHD_create_response_from_buffer(
             reply.length, cast(void*)reply.buffer,
-            MHD_RESPMEM_MUST_FREE);
+            reply.mode);
         if (response == null)
             throw new MHDException("MHD_create_response_from_buffer");
-        
+
         MHD_Result result = void;
-        
+
         result = MHD_add_response_header(response, "Content-Type", contentType);
         if (result == MHD_NO)
             throw new MHDException("MHD_add_response_header");
@@ -228,59 +265,7 @@ struct HTTPRequest
         result = MHD_queue_response(connection, http_code, response);
         if (result == MHD_NO)
             throw new MHDException("MHD_queue_response");
-        
-        MHD_destroy_response(response);
-    }
-    
-    // Reply using an unchanging, immutable buffer
-    void replyStaticBuffer(int http_code, inout(void)[] content, inout(char) *contentType)
-    {
-        MHD_Response *response = MHD_create_response_from_buffer(
-            content.length, cast(void*)content.ptr,
-            MHD_RESPMEM_PERSISTENT);
-        if (response == null)
-            throw new MHDException("MHD_create_response_from_buffer");
-        
-        MHD_Result result = void;
-        
-        result = MHD_add_response_header(response, "Content-Type", contentType);
-        if (result == MHD_NO)
-            throw new MHDException("MHD_add_response_header");
 
-        result = MHD_queue_response(connection, http_code, response);
-        if (result == MHD_NO)
-            throw new MHDException("MHD_queue_response");
-        
-        MHD_destroy_response(response);
-    }
-    
-    // HACK: mode is a hack
-    //       Need to do a "createReplyXYZ" that returns a struct to "properly" reply
-    //       using appropriate strategy.
-    //       This function specifically could be renamed to something else
-    // Reply
-    deprecated
-    void reply(int http_code, inout(void)[] content, inout(string) contentType, int mode = MHD_RESPMEM_PERSISTENT)
-    {
-        // MHD_RESPMEM_PERSISTENT
-        // MHD_RESPMEM_MUST_FREE
-        // MHD_RESPMEM_MUST_COPY
-        MHD_Response *response = MHD_create_response_from_buffer(
-            content.length, cast(void*)content.ptr,
-            mode);
-        if (response == null)
-            throw new MHDException("MHD_create_response_from_buffer");
-        
-        MHD_Result result = void;
-        
-        result = MHD_add_response_header(response, "Content-Type", toStringz(contentType));
-        if (result == MHD_NO)
-            throw new MHDException("MHD_add_response_header");
-
-        result = MHD_queue_response(connection, http_code, response);
-        if (result == MHD_NO)
-            throw new MHDException("MHD_queue_response");
-        
         MHD_destroy_response(response);
     }
     
@@ -496,17 +481,18 @@ MHD_Result ddhttpd_handler(void *cls,
         else if (HttpServerException hex = cast(HttpServerException)ex)
         {
             import std.format : sformat;
-            char[256] buffer = void;
-            char[] res = sformat(buffer,
+            char[256] buf = void;
+            char[] res = sformat(buf,
                 `<!DOCTYPE html><html><body>%s - %s</body></html>`,
                 hex.code, hex.msg);
-            req.reply(hex.code, res, `text/html`, MHD_RESPMEM_MUST_COPY);
+            req.reply(hex.code, HTTPReply.copyBuffer(res), `text/html`);
         }
         else
         {
             req.reply(
                 500,
-                `<!DOCTYPE html><html><body>Internal server error</body></html>`,
+                HTTPReply.staticBuffer(
+                    `<!DOCTYPE html><html><body>Internal server error</body></html>`),
                 `text/html`
             );
         }
