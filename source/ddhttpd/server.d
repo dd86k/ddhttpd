@@ -297,6 +297,40 @@ struct HTTPRequest
         return this;
     }
 
+    /// Send a redirect response.
+    void redirect(int http_code, string location)
+    {
+        MHD_Response *response = MHD_create_response_from_buffer(
+            0, null, MHD_RESPMEM_PERSISTENT);
+        if (response == null)
+            throw new MHDException("MHD_create_response_from_buffer");
+
+        MHD_Result result = void;
+
+        result = MHD_add_response_header(response, "Location", toStringz(location));
+        if (result == MHD_NO)
+            throw new MHDException("MHD_add_response_header");
+
+        foreach (h; response_headers)
+        {
+            result = MHD_add_response_header(response, h.key, h.value);
+            if (result == MHD_NO)
+                throw new MHDException("MHD_add_response_header");
+        }
+
+        result = MHD_queue_response(connection, http_code, response);
+        if (result == MHD_NO)
+            throw new MHDException("MHD_queue_response");
+
+        MHD_destroy_response(response);
+    }
+
+    /// Send a JSON response.
+    void replyJSON(int http_code, const(char)[] json_body)
+    {
+        reply(http_code, HTTPReply.copyBuffer(json_body), "application/json");
+    }
+
     /// GET parameter
     string param(string key)
     {
