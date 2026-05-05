@@ -506,7 +506,7 @@ class HTTPServer
             throw new Exception("Path needs to start with '/'");
         if (!handler)
             throw new Exception("Need handler function");
-        state.ws_routes ~= WSRoute(path, handler);
+        state.ws_routes ~= WSRoute(PathPattern(null, path, null), handler);
         return this;
     }
     
@@ -583,7 +583,7 @@ struct Route
 
 struct WSRoute
 {
-    string path;
+    PathPattern pattern;
     void delegate(WebSocketConnection) handler;
 }
 
@@ -742,7 +742,7 @@ MHD_Result ddhttpd_handler(void *cls,
             {
                 foreach (ref wsroute; state.ws_routes)
                 {
-                    if (wsroute.path == req.path)
+                    if (wsroute.pattern.match(req.path, req.params))
                         return ws_handle_upgrade(connection, req, wsroute.handler);
                 }
             }
@@ -792,7 +792,7 @@ MHD_Result ws_handle_upgrade(MHD_Connection *connection, ref HTTPRequest req,
 
     string accept = ws_compute_accept(key);
 
-    WSUpgradeClosure *cl = new WSUpgradeClosure(handler);
+    WSUpgradeClosure *cl = new WSUpgradeClosure(handler, req.params);
     GC.addRoot(cast(void*)cl);
 
     MHD_Response *resp = MHD_create_response_for_upgrade(&ws_upgrade_callback, cast(void*)cl);

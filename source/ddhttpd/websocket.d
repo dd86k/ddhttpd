@@ -107,6 +107,9 @@ struct WebSocketConnection
 
     bool isClosed() const @property { return closed; }
 
+    /// URL parameters extracted from a pattern route (e.g. /ws/:id → params["id"]).
+    string[string] params;
+
 package(ddhttpd):
     this(MHD_socket sock_, MHD_UpgradeResponseHandle *urh_, const(ubyte)[] extra)
     {
@@ -254,6 +257,7 @@ package(ddhttpd) string ws_compute_accept(string key)
 package(ddhttpd) struct WSUpgradeClosure
 {
     void delegate(WebSocketConnection) handler;
+    string[string] params;
 }
 
 extern(C) package(ddhttpd) void ws_upgrade_callback(
@@ -288,6 +292,7 @@ extern(C) package(ddhttpd) void ws_upgrade_callback(
         try
         {
             WebSocketConnection conn = WebSocketConnection(sock, urh, extra);
+            conn.params = cl.params;
             cl.handler(conn);
         }
         catch (Exception) {}
