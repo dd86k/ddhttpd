@@ -3,12 +3,13 @@ module ddhttpd.server;
 import bindbc.libmicrohttpd;
 static if (!bindbc.libmicrohttpd.staticBinding)
     import bindbc.loader;
-import core.memory : GC; // to help manage post/put uploads
+import core.memory : GC;
 import core.thread.osthread : Thread, thread_attachThis;
 import std.conv : text;
 import std.encoding;
 import std.stdio;
 import std.string : toStringz, fromStringz, indexOf;
+import ddhttpd.websocket : WebSocketConnection, WSUpgradeClosure, ws_upgrade_callback, ws_compute_accept;
 
 /// Printable ddhttpd version
 enum DDHTTPD_VERSION = "0.0.1";
@@ -494,6 +495,20 @@ class HTTPServer
     {
         return addRoute("CONNECT", path, handler);
     }
+
+    /// Register a WebSocket handler for the given path.
+    /// The handler receives a WebSocketConnection and runs in its own thread.
+    typeof(this) websocket(string path, void delegate(WebSocketConnection) handler)
+    {
+        if (!path)
+            throw new Exception("Path required");
+        if (path[0] != '/')
+            throw new Exception("Path needs to start with '/'");
+        if (!handler)
+            throw new Exception("Need handler function");
+        state.ws_routes ~= WSRoute(path, handler);
+        return this;
+    }
     
     /// Get the port the server is listening on (useful when started with port 0).
     ushort port()
@@ -532,6 +547,9 @@ class HTTPServer
             throw new Exception("Already started");
         
         flags |= DEFAULT_FLAGS;
+        // WS needs to allow upgrading for it to work, do it transparently
+        if (state.ws_routes.length)
+            flags |= MHD_ALLOW_UPGRADE;
         
         state.daemon = MHD_start_daemon(
             flags, port,
@@ -563,11 +581,18 @@ struct Route
     int delegate(ref HTTPRequest) handler;
 }
 
+struct WSRoute
+{
+    string path;
+    void delegate(WebSocketConnection) handler;
+}
+
 struct ServerState
 {
     MHD_Daemon *daemon;
     Route[string][string] exact_routes;
     PathPattern[] pattern_routes;
+    WSRoute[] ws_routes;
     int delegate(ref HTTPRequest, Exception) on_error_exception;
     size_t max_upload_size;
     uint thread_pool_size;
@@ -708,6 +733,20 @@ MHD_Result ddhttpd_handler(void *cls,
             if (req.method == route.method && route.match(req.path, req.params))
                 return route.handler(req);
         }
+        
+        if (state.ws_routes.length && req.method == "GET")
+        {
+            import std.uni : toLower;
+            string upgrade_hdr = req.header("Upgrade");
+            if (upgrade_hdr && toLower(upgrade_hdr) == "websocket")
+            {
+                foreach (ref wsroute; state.ws_routes)
+                {
+                    if (wsroute.path == req.path)
+                        return ws_handle_upgrade(connection, req, wsroute.handler);
+                }
+            }
+        }
 
         throw new HttpServerException(HTTPStatus.notFound, HTTPMsg.notFound, req);
     }
@@ -737,6 +776,39 @@ MHD_Result ddhttpd_handler(void *cls,
         }
         return MHD_YES;
     }
+}
+
+MHD_Result ws_handle_upgrade(MHD_Connection *connection, ref HTTPRequest req,
+    void delegate(WebSocketConnection) handler)
+{
+    string key = req.header("Sec-WebSocket-Key");
+    if (!key)
+    {
+        MHD_Response *resp = MHD_create_response_from_buffer(0, null, MHD_RESPMEM_PERSISTENT);
+        MHD_queue_response(connection, HTTPStatus.badRequest, resp);
+        MHD_destroy_response(resp);
+        return MHD_YES;
+    }
+
+    string accept = ws_compute_accept(key);
+
+    WSUpgradeClosure *cl = new WSUpgradeClosure(handler);
+    GC.addRoot(cast(void*)cl);
+
+    MHD_Response *resp = MHD_create_response_for_upgrade(&ws_upgrade_callback, cast(void*)cl);
+    if (!resp)
+    {
+        GC.removeRoot(cast(void*)cl);
+        return MHD_NO;
+    }
+
+    MHD_add_response_header(resp, MHD_HTTP_HEADER_UPGRADE, "websocket");
+    MHD_add_response_header(resp, MHD_HTTP_HEADER_CONNECTION, "Upgrade");
+    MHD_add_response_header(resp, MHD_HTTP_HEADER_SEC_WEBSOCKET_ACCEPT, toStringz(accept));
+
+    MHD_Result result = MHD_queue_response(connection, MHD_HTTP_SWITCHING_PROTOCOLS, resp);
+    MHD_destroy_response(resp);
+    return result;
 }
 
 struct PathPattern
