@@ -1,6 +1,7 @@
 module ddhttpd.websocket;
 
 import bindbc.libmicrohttpd;
+import core.atomic : atomicLoad, atomicStore;
 import core.memory : GC;
 import core.thread.osthread : Thread, thread_attachThis;
 
@@ -50,8 +51,8 @@ struct WebSocketConnection
     /// Send a close frame and mark the connection closed on this side.
     void close(ushort code = 1000, string reason = "")
     {
-        if (closed) return;
-        closed = true;
+        if (atomicLoad(closed)) return;
+        atomicStore(closed, true);
 
         ubyte[125] buf = void; // control frames are capped at 125 bytes
         buf[0] = cast(ubyte)(code >> 8);
@@ -82,9 +83,9 @@ struct WebSocketConnection
                     continue;
 
                 case WSOpcode.close:
-                    if (!closed)
+                    if (!atomicLoad(closed))
                     {
-                        closed = true;
+                        atomicStore(closed, true);
                         send_frame(WSOpcode.close, f.payload);
                     }
                     return WSMessage(WSOpcode.close, f.payload);
@@ -105,7 +106,7 @@ struct WebSocketConnection
         }
     }
 
-    bool isClosed() const @property { return closed; }
+    bool isClosed() const @property { return atomicLoad(closed); }
 
     /// URL parameters extracted from a pattern route (e.g. /ws/:id → params["id"]).
     string[string] params;
@@ -123,7 +124,7 @@ private:
     MHD_socket                 sock;
     MHD_UpgradeResponseHandle *urh;
     ubyte[]                    pending; // data pre-buffered by MHD before the upgrade
-    bool                       closed;
+    shared bool                closed;
 
     private struct WSFrame
     {
