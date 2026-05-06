@@ -201,10 +201,53 @@ private:
         return WSFrame(fin, opcode, payload);
     }
 
+    version (Windows)
+    {
+        import core.sys.windows.winsock2 :
+            recv, send, WSAPoll, WSAGetLastError,
+            WSAEWOULDBLOCK, WSAEINTR, WSAPOLLFD, POLLRDNORM, POLLWRNORM;
+
+        static int sock_last_error() { return WSAGetLastError(); }
+        static bool sock_would_block(int e) { return e == WSAEWOULDBLOCK; }
+        static bool sock_intr(int e)        { return e == WSAEINTR; }
+    }
+    else
+    {
+        import core.sys.posix.sys.socket : recv, send;
+        import core.sys.posix.poll : pollfd, poll, POLLIN, POLLOUT;
+        import core.stdc.errno : errno, EAGAIN, EWOULDBLOCK, EINTR;
+
+        static int sock_last_error() { return errno; }
+        static bool sock_would_block(int e) { return e == EAGAIN || e == EWOULDBLOCK; }
+        static bool sock_intr(int e)        { return e == EINTR; }
+    }
+
+    void wait_socket(short events)
+    {
+        version (Windows)
+        {
+            WSAPOLLFD pfd;
+            pfd.fd = sock;
+            pfd.events = events;
+            int pr = WSAPoll(&pfd, 1, -1);
+            if (pr < 0)
+                throw new Exception("WebSocket poll failed");
+        }
+        else
+        {
+            pollfd pfd;
+            pfd.fd = sock;
+            pfd.events = events;
+            int pr = poll(&pfd, 1, -1);
+            if (pr < 0 && errno == EINTR)
+                return;
+            if (pr < 0)
+                throw new Exception("WebSocket poll failed");
+        }
+    }
+
     void recv_exact(ubyte[] buf)
     {
-        import core.sys.posix.sys.socket : recv;
-
         size_t off;
 
         if (pending.length)
@@ -217,29 +260,65 @@ private:
 
         while (off < buf.length)
         {
-            ptrdiff_t n = recv(sock, buf.ptr + off, buf.length - off, 0);
-            if (n <= 0)
+            version (Windows)
+                int n = recv(sock, cast(char*)(buf.ptr + off), cast(int)(buf.length - off), 0);
+            else
+                ptrdiff_t n = recv(sock, buf.ptr + off, buf.length - off, 0);
+
+            if (n > 0)
+            {
+                off += cast(size_t)n;
+                continue;
+            }
+            if (n == 0)
                 throw new Exception("WebSocket connection lost");
-            off += cast(size_t)n;
+
+            int e = sock_last_error();
+            if (sock_intr(e))
+                continue;
+            if (sock_would_block(e))
+            {
+                version (Windows) wait_socket(POLLRDNORM);
+                else              wait_socket(POLLIN);
+                continue;
+            }
+            throw new Exception("WebSocket connection lost");
         }
     }
 
     void send_all(const(ubyte)[] data)
     {
-        import core.sys.posix.sys.socket : send;
-
         version (linux)
-            enum int sendFlags = 0x4000; // MSG_NOSIGNAL
+            enum int sendFlags = 0x4000; // MSG_NOSIGNAL (no SIGPIPE on Windows)
         else
             enum int sendFlags = 0;
 
         size_t off;
         while (off < data.length)
         {
-            ptrdiff_t n = send(sock, data.ptr + off, data.length - off, sendFlags);
-            if (n <= 0)
+            version (Windows)
+                int n = send(sock, cast(const(char)*)(data.ptr + off), cast(int)(data.length - off), sendFlags);
+            else
+                ptrdiff_t n = send(sock, data.ptr + off, data.length - off, sendFlags);
+
+            if (n > 0)
+            {
+                off += cast(size_t)n;
+                continue;
+            }
+            if (n == 0)
                 throw new Exception("WebSocket send failed");
-            off += cast(size_t)n;
+
+            int e = sock_last_error();
+            if (sock_intr(e))
+                continue;
+            if (sock_would_block(e))
+            {
+                version (Windows) wait_socket(POLLWRNORM);
+                else              wait_socket(POLLOUT);
+                continue;
+            }
+            throw new Exception("WebSocket send failed");
         }
     }
 }
