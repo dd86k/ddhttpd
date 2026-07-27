@@ -197,6 +197,73 @@ void testUploadLimit()
     }
 }
 
+void testAddressBinding()
+{
+    writeln("test: address binding");
+
+    HTTPServer bound = new HTTPServer()
+        .addRoute("GET", "/", (ref HTTPRequest req)
+        {
+            req.reply(200, HTTPReply.staticBuffer("bound"), "text/plain");
+            return REQUEST_OK;
+        });
+    bound.start("127.0.0.1", 0);
+    scope(exit) bound.stop();
+
+    auto http = HTTP(text("http://127.0.0.1:", bound.port(), "/"));
+    char[] body_;
+    http.onReceive = (ubyte[] data) { body_ ~= cast(char[])data; return data.length; };
+    http.perform();
+    check(http.statusLine.code == 200, text("expected 200, got ", http.statusLine.code));
+    check(body_ == "bound", text("unexpected body: ", body_));
+
+    // Binding twice on the same server is refused
+    bool refused;
+    try
+        bound.start("127.0.0.1", 0);
+    catch (Exception ex)
+        refused = true;
+    check(refused, "expected second start() to throw");
+
+    // Unresolvable addresses are reported before reaching MHD
+    HTTPServer bad = new HTTPServer()
+        .addRoute("GET", "/", (ref HTTPRequest req) { return REQUEST_OK; });
+    bool threw;
+    try
+        bad.start("no.such.host.invalid", 0);
+    catch (Exception ex)
+        threw = true;
+    check(threw, "expected start() to throw on unresolvable address");
+}
+
+void testIPv6Binding()
+{
+    writeln("test: IPv6 address binding");
+
+    HTTPServer bound = new HTTPServer()
+        .addRoute("GET", "/", (ref HTTPRequest req)
+        {
+            req.reply(200, HTTPReply.staticBuffer("v6"), "text/plain");
+            return REQUEST_OK;
+        });
+
+    try
+        bound.start("::1", 0);
+    catch (Exception ex)
+    {
+        writeln("  skipped: ", ex.msg);
+        return;
+    }
+    scope(exit) bound.stop();
+
+    auto http = HTTP(text("http://[::1]:", bound.port(), "/"));
+    char[] body_;
+    http.onReceive = (ubyte[] data) { body_ ~= cast(char[])data; return data.length; };
+    http.perform();
+    check(http.statusLine.code == 200, text("expected 200, got ", http.statusLine.code));
+    check(body_ == "v6", text("unexpected body: ", body_));
+}
+
 void main()
 {
     HTTPServer server = new HTTPServer()
@@ -245,6 +312,8 @@ void main()
     testPostEmptyBody();
     testPostLargeBody();
     testUploadLimit();
+    testAddressBinding();
+    testIPv6Binding();
 
     writeln();
     if (failures > 0)

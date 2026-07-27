@@ -7,6 +7,7 @@ import core.memory : GC;
 import core.thread.osthread : Thread, thread_attachThis;
 import std.conv : text;
 import std.encoding;
+import std.socket : Address;
 import std.stdio;
 import std.string : toStringz, fromStringz, indexOf;
 import ddhttpd.websocket : WebSocketConnection, WSUpgradeClosure, ws_upgrade_callback, ws_compute_accept;
@@ -533,37 +534,105 @@ class HTTPServer
     // Start daemon mode
     void start(ushort port, int flags = 0)
     {
+        startDaemon(null, port, flags);
+    }
+
+    /// Start daemon mode, binding the listening socket to a specific address.
+    ///
+    /// The address can be a numeric IPv4 address ("127.0.0.1"), a numeric IPv6
+    /// address ("::1"), or a hostname ("localhost"), which is resolved to its
+    /// first matching address.
+    /// Params:
+    ///   address = Address to bind the listening socket to.
+    ///   port = Port to listen on, 0 to let the system pick one.
+    ///   flags = Additional start flags.
+    void start(string address, ushort port, int flags = 0)
+    {
+        if (!address)
+            throw new Exception("Address required");
+
+        startDaemon(resolveBindAddress(address, port, (flags & START_IPV6) != 0), port, flags);
+    }
+
+    /// Start daemon mode, binding the listening socket to an already resolved
+    /// address, like `new InternetAddress("127.0.0.1", 8080)`.
+    /// Params:
+    ///   address = Address to bind the listening socket to.
+    ///   flags = Additional start flags.
+    void start(Address address, int flags = 0)
+    {
+        if (!address)
+            throw new Exception("Address required");
+
+        startDaemon(address, 0, flags);
+    }
+
+private:
+
+    void startDaemon(Address address, ushort port, int flags)
+    {
         version (linux)
             enum DEFAULT_FLAGS =
                 MHD_USE_TCP_FASTOPEN | // >=3.6
                 MHD_USE_INTERNAL_POLLING_THREAD |
                 MHD_USE_POLL;
         else
-            enum DEFAULT_FLAGS = 
+            enum DEFAULT_FLAGS =
                 MHD_USE_INTERNAL_POLLING_THREAD |
                 MHD_USE_POLL;
-        
+
         if (state.daemon)
             throw new Exception("Already started");
-        
+
         flags |= DEFAULT_FLAGS;
         // WS needs to allow upgrading for it to work, do it transparently
         if (state.ws_routes.length)
             flags |= MHD_ALLOW_UPGRADE;
-        
-        state.daemon = MHD_start_daemon(
-            flags, port,
-            null, null,
-            &ddhttpd_handler, &state,
-            MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,
-            MHD_OPTION_STRICT_FOR_CLIENT, 0,
-            MHD_OPTION_THREAD_POOL_SIZE, state.thread_pool_size,
-            MHD_OPTION_END);
+
+        if (address)
+        {
+            import std.socket : AddressFamily;
+
+            // MHD creates the listening socket using the family selected by the
+            // flags, so it must match the family of the address we hand it
+            if (address.addressFamily == AddressFamily.INET6)
+                flags |= MHD_USE_IPv6;
+            else if (flags & MHD_USE_IPv6)
+                throw new Exception(text("IPv6 requested with non-IPv6 address '",
+                    address.toAddrString(), "'"));
+
+            // MHD only reads the sockaddr while starting, but keep it around
+            // for the lifetime of the daemon anyway
+            state.listen_addr = address;
+
+            // Port is taken from the address, MHD ignores its port argument
+            // when given MHD_OPTION_SOCK_ADDR
+            state.daemon = MHD_start_daemon(
+                flags, port,
+                null, null,
+                &ddhttpd_handler, &state,
+                MHD_OPTION_SOCK_ADDR, address.name,
+                MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,
+                MHD_OPTION_STRICT_FOR_CLIENT, 0,
+                MHD_OPTION_THREAD_POOL_SIZE, state.thread_pool_size,
+                MHD_OPTION_END);
+        }
+        else
+        {
+            state.daemon = MHD_start_daemon(
+                flags, port,
+                null, null,
+                &ddhttpd_handler, &state,
+                MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,
+                MHD_OPTION_STRICT_FOR_CLIENT, 0,
+                MHD_OPTION_THREAD_POOL_SIZE, state.thread_pool_size,
+                MHD_OPTION_END);
+        }
+
         if (state.daemon == null)
             throw new MHDException("MHD_start_daemon");
     }
-    
-private:
+
     ServerState state;
 }
 
@@ -572,6 +641,37 @@ private:
 //
 
 private:
+
+/// Resolve a numeric address or hostname into an address usable for binding.
+/// Params:
+///   address = Numeric address or hostname.
+///   port = Port number.
+///   prefer_ipv6 = Select the first IPv6 result, if any.
+/// Returns: Resolved address.
+Address resolveBindAddress(string address, ushort port, bool prefer_ipv6)
+{
+    import std.socket : AddressFamily, AddressInfo, getAddressInfo, SocketException, SocketType;
+
+    AddressInfo[] infos;
+    try
+    {
+        infos = getAddressInfo(address, text(port), SocketType.STREAM);
+    }
+    catch (SocketException ex)
+    {
+        throw new Exception(text("Could not resolve address '", address, "': ", ex.msg));
+    }
+
+    if (infos.length == 0)
+        throw new Exception(text("No addresses found for '", address, "'"));
+
+    if (prefer_ipv6)
+        foreach (ref AddressInfo info; infos)
+            if (info.family == AddressFamily.INET6)
+                return info.address;
+
+    return infos[0].address;
+}
 
 /// A single url path route
 struct Route
@@ -593,6 +693,8 @@ struct ServerState
     Route[string][string] exact_routes;
     PathPattern[] pattern_routes;
     WSRoute[] ws_routes;
+    /// Address the listening socket is bound to, null when binding to any address
+    Address listen_addr;
     int delegate(ref HTTPRequest, Exception) on_error_exception;
     size_t max_upload_size;
     uint thread_pool_size;
