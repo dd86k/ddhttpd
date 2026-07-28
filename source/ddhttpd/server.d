@@ -3,13 +3,14 @@ module ddhttpd.server;
 import bindbc.libmicrohttpd;
 static if (!bindbc.libmicrohttpd.staticBinding)
     import bindbc.loader;
+import core.atomic : atomicLoad, atomicStore;
 import core.memory : GC;
+import core.thread.osthread : Thread;
 import std.conv : text;
 import std.encoding;
-import std.socket : Address;
+import std.socket : Address, Socket;
 import std.stdio;
 import std.string : toStringz, fromStringz, indexOf;
-import ddhttpd.thread : attach_this_thread;
 import ddhttpd.websocket : WebSocketConnection, WSUpgradeClosure, ws_upgrade_callback, ws_compute_accept;
 
 /// Printable ddhttpd version
@@ -410,11 +411,20 @@ class HTTPServer
         return this;
     }
 
-    /// Set the number of threads in MHD's internal thread pool.
-    /// Must be called before start(). Default is 0 (single thread).
+    /// Set how many event loop threads serve requests. Must be called before
+    /// start(). Default is 1.
+    ///
+    /// Handlers run on one thread each, so anything above 1 means handlers can
+    /// run concurrently and whatever state they share needs its own
+    /// synchronization. `std.parallelism.totalCPUs` is a reasonable value, but
+    /// note it reports the machine's cores, not a container's CPU quota.
     typeof(this) threadPoolSize(uint size)
     {
-        state.thread_pool_size = size;
+        if (size == 0)
+            throw new Exception("Need at least one thread");
+        if (state.loops.length)
+            throw new Exception("Already started");
+        state.pool_size = size;
         return this;
     }
 
@@ -514,20 +524,58 @@ class HTTPServer
     /// Get the port the server is listening on (useful when started with port 0).
     ushort port()
     {
-        if (!state.daemon)
+        if (state.loops.length == 0)
             throw new Exception("Server not started");
-        const(MHD_DaemonInfo)* info = MHD_get_daemon_info(state.daemon, MHD_DAEMON_INFO_BIND_PORT);
-        if (info == null)
-            throw new MHDException("MHD_get_daemon_info");
-        return info.port;
+        return state.bound_port;
     }
 
+    /// Stop serving and wait for the event loop threads to finish.
+    ///
+    /// Worth calling before the program exits: the event loop threads are
+    /// daemon threads, so termination does not wait for them and they may
+    /// still be serving requests while the runtime shuts down.
     void stop()
     {
-        if (state.daemon)
+        if (state.loops.length == 0)
+            return;
+
+        foreach (ref DaemonLoop dl; state.loops)
+            if (Thread.getThis() is dl.thread)
+                throw new Exception("Cannot stop the server from a request handler");
+
+        // The loops check this at most POLL_INTERVAL msecs from now
+        foreach (ref DaemonLoop dl; state.loops)
         {
-            MHD_stop_daemon(state.daemon);
-            state.daemon = null;
+            atomicStore(dl.running, false);
+        }
+
+        foreach (ref DaemonLoop dl; state.loops)
+        {
+            if (dl.thread)
+            {
+                dl.thread.join(); // rethrows what the loop threw
+                dl.thread = null;
+            }
+        }
+
+        foreach (ref DaemonLoop dl; state.loops)
+        {
+            if (dl.daemon == null) // start() failed partway through
+                continue;
+            // Every daemon in a pool was handed the same listening socket, and
+            // MHD_stop_daemon closes it. Quiescing hands it back to us first,
+            // so it is only closed once, by us.
+            if (state.listener)
+                MHD_quiesce_daemon(dl.daemon);
+            MHD_stop_daemon(dl.daemon);
+            dl.daemon = null;
+        }
+
+        state.loops = null;
+        if (state.listener)
+        {
+            state.listener.close();
+            state.listener = null;
         }
     }
     
@@ -571,17 +619,22 @@ private:
 
     void startDaemon(Address address, ushort port, int flags)
     {
+        // MHD runs in "external" polling mode: without
+        // MHD_USE_INTERNAL_POLLING_THREAD it creates no threads of its own and
+        // every callback runs on the thread calling MHD_run, which is a thread
+        // we create and the D runtime therefore knows about.
+        //
+        // MHD_USE_POLL is an internal polling mode option only. epoll is
+        // usable from an external loop, since MHD hands out the epoll
+        // descriptor to wait on.
         version (linux)
             enum DEFAULT_FLAGS =
                 MHD_USE_TCP_FASTOPEN | // >=3.6
-                MHD_USE_INTERNAL_POLLING_THREAD |
-                MHD_USE_POLL;
+                MHD_USE_EPOLL;
         else
-            enum DEFAULT_FLAGS =
-                MHD_USE_INTERNAL_POLLING_THREAD |
-                MHD_USE_POLL;
+            enum DEFAULT_FLAGS = 0;
 
-        if (state.daemon)
+        if (state.loops.length)
             throw new Exception("Already started");
 
         flags |= DEFAULT_FLAGS;
@@ -593,8 +646,8 @@ private:
         {
             import std.socket : AddressFamily;
 
-            // MHD creates the listening socket using the family selected by the
-            // flags, so it must match the family of the address we hand it
+            // The listening socket is created using the family selected by the
+            // flags, so it must match the family of the address
             if (address.addressFamily == AddressFamily.INET6)
                 flags |= MHD_USE_IPv6;
             else if (flags & MHD_USE_IPv6)
@@ -604,33 +657,121 @@ private:
             // MHD only reads the sockaddr while starting, but keep it around
             // for the lifetime of the daemon anyway
             state.listen_addr = address;
-
-            // Port is taken from the address, MHD ignores its port argument
-            // when given MHD_OPTION_SOCK_ADDR
-            state.daemon = MHD_start_daemon(
-                flags, port,
-                null, null,
-                &ddhttpd_handler, &state,
-                MHD_OPTION_SOCK_ADDR, address.name,
-                MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,
-                MHD_OPTION_STRICT_FOR_CLIENT, 0,
-                MHD_OPTION_THREAD_POOL_SIZE, state.thread_pool_size,
-                MHD_OPTION_END);
         }
-        else
+
+        // Every daemon in a pool has to accept from the same socket: one
+        // socket each would mean one port each when starting on port 0, and
+        // MHD only splits a listening socket across threads it owns itself.
+        if (state.pool_size > 1)
+            state.listener = createListener(address, port, flags);
+
+        // Undoes whatever got started before something failed
+        scope(failure) stop();
+
+        state.loops = new DaemonLoop[](state.pool_size);
+        foreach (ref DaemonLoop dl; state.loops)
         {
-            state.daemon = MHD_start_daemon(
-                flags, port,
-                null, null,
-                &ddhttpd_handler, &state,
-                MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,
-                MHD_OPTION_STRICT_FOR_CLIENT, 0,
-                MHD_OPTION_THREAD_POOL_SIZE, state.thread_pool_size,
-                MHD_OPTION_END);
+            if (state.listener)
+                dl.daemon = MHD_start_daemon(
+                    flags, port,
+                    null, null,
+                    &ddhttpd_handler, &state,
+                    MHD_OPTION_LISTEN_SOCKET, state.listener.handle,
+                    MHD_OPTION_STRICT_FOR_CLIENT, 0,
+                    MHD_OPTION_END);
+            else if (address)
+                // Port is taken from the address, MHD ignores its port argument
+                // when given MHD_OPTION_SOCK_ADDR
+                dl.daemon = MHD_start_daemon(
+                    flags, port,
+                    null, null,
+                    &ddhttpd_handler, &state,
+                    MHD_OPTION_SOCK_ADDR, address.name,
+                    MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,
+                    MHD_OPTION_STRICT_FOR_CLIENT, 0,
+                    MHD_OPTION_END);
+            else
+                dl.daemon = MHD_start_daemon(
+                    flags, port,
+                    null, null,
+                    &ddhttpd_handler, &state,
+                    MHD_OPTION_LISTENING_ADDRESS_REUSE, 1,
+                    MHD_OPTION_STRICT_FOR_CLIENT, 0,
+                    MHD_OPTION_END);
+
+            if (dl.daemon == null)
+                throw new MHDException("MHD_start_daemon");
+
+            version (linux)
+            {
+                // Fail here rather than inside the loop thread
+                const(MHD_DaemonInfo) *info =
+                    MHD_get_daemon_info(dl.daemon, MHD_DAEMON_INFO_EPOLL_FD);
+                if (info == null)
+                    throw new MHDException("MHD_get_daemon_info");
+                dl.epoll_fd = info.epoll_fd;
+            }
         }
 
-        if (state.daemon == null)
-            throw new MHDException("MHD_start_daemon");
+        state.bound_port = state.listener
+            ? addressPort(state.listener.localAddress)
+            : daemonPort(state.loops[0].daemon);
+
+        foreach (ref DaemonLoop dl; state.loops)
+        {
+            atomicStore(dl.running, true);
+
+            // The loop delegate points into the array, which is never resized,
+            // and keeps this instance alive for as long as the thread runs
+            dl.thread = new Thread(&dl.loop);
+            // A program that never calls stop() should still be able to exit,
+            // like it could when MHD owned the threads
+            dl.thread.isDaemon = true;
+            dl.thread.start();
+        }
+    }
+
+    /// Create the socket a pool of daemons accepts from.
+    static Socket createListener(Address address, ushort port, int flags)
+    {
+        import std.socket : AddressFamily, Internet6Address, InternetAddress,
+            ProtocolType, SocketOption, SocketOptionLevel, SocketType;
+
+        version (Windows)
+            import core.sys.windows.winsock2 : SOMAXCONN;
+        else
+            import core.sys.posix.sys.socket : SOMAXCONN;
+
+        AddressFamily family = address ? address.addressFamily :
+            (flags & MHD_USE_IPv6 ? AddressFamily.INET6 : AddressFamily.INET);
+
+        Socket sock = new Socket(family, SocketType.STREAM, ProtocolType.TCP);
+        scope(failure) sock.close();
+
+        sock.setOption(SocketOptionLevel.SOCKET, SocketOption.REUSEADDR, true);
+
+        if (family == AddressFamily.INET6)
+            sock.setOption(SocketOptionLevel.IPV6, SocketOption.IPV6_V6ONLY,
+                (flags & MHD_USE_DUAL_STACK) == MHD_USE_DUAL_STACK ? 0 : 1);
+
+        // MHD sets this on sockets it creates, do the same for ours
+        version (linux)
+            if (flags & MHD_USE_TCP_FASTOPEN)
+            {
+                import core.sys.linux.netinet.tcp : TCP_FASTOPEN;
+                sock.setOption(SocketOptionLevel.TCP,
+                    cast(SocketOption)TCP_FASTOPEN, FASTOPEN_QUEUE);
+            }
+
+        if (address)
+            sock.bind(address);
+        else if (family == AddressFamily.INET6)
+            sock.bind(new Internet6Address(Internet6Address.ADDR_ANY, port));
+        else
+            sock.bind(new InternetAddress(InternetAddress.ADDR_ANY, port));
+
+        sock.listen(SOMAXCONN);
+        return sock;
     }
 
     ServerState state;
@@ -689,7 +830,6 @@ struct WSRoute
 
 struct ServerState
 {
-    MHD_Daemon *daemon;
     Route[string][string] exact_routes;
     PathPattern[] pattern_routes;
     WSRoute[] ws_routes;
@@ -697,7 +837,106 @@ struct ServerState
     Address listen_addr;
     int delegate(ref HTTPRequest, Exception) on_error_exception;
     size_t max_upload_size;
-    uint thread_pool_size;
+    /// One daemon and one thread per pool slot, empty until start()
+    DaemonLoop[] loops;
+    /// Listening socket shared by a pool, null when MHD owns the socket
+    Socket listener;
+    ushort bound_port;
+    uint pool_size = 1;
+}
+
+/// One MHD daemon and the thread driving it. Handlers run on that thread,
+/// which the D runtime knows about, unlike a thread MHD would have made.
+struct DaemonLoop
+{
+    MHD_Daemon *daemon;
+    Thread thread;
+    /// Cleared by stop() to bring the loop down
+    shared bool running;
+    version (linux) int epoll_fd = -1;
+
+    /// Longest a wait may last, so that stop() is noticed reasonably quickly
+    enum int POLL_INTERVAL = 100;
+
+    /// How long to wait for network activity, in msecs. MHD needs to run again
+    /// once its timeout expires, or connections hang and never time out.
+    int wait_time()
+    {
+        MHD_UNSIGNED_LONG_LONG timeout = void;
+        if (MHD_get_timeout(daemon, &timeout) == MHD_NO)
+            return POLL_INTERVAL;
+        return timeout < POLL_INTERVAL ? cast(int)timeout : POLL_INTERVAL;
+    }
+
+    /// Wait for activity, then let MHD process it, until stop() says otherwise.
+    void loop()
+    {
+        version (linux)
+        {
+            import core.sys.posix.poll : pollfd, poll, POLLIN;
+
+            // MHD registers every socket it owns, including the listening one,
+            // with this epoll descriptor
+            pollfd pfd;
+            pfd.fd     = epoll_fd;
+            pfd.events = POLLIN;
+
+            while (atomicLoad(running))
+            {
+                poll(&pfd, 1, wait_time());
+                MHD_run(daemon);
+            }
+        }
+        else
+        {
+            version (Windows)
+                import core.sys.windows.winsock2 : fd_set, FD_ZERO, select, timeval;
+            else
+                import core.sys.posix.sys.select : fd_set, FD_ZERO, select, timeval;
+
+            while (atomicLoad(running))
+            {
+                fd_set rs = void, ws = void, es = void;
+                FD_ZERO(&rs);
+                FD_ZERO(&ws);
+                FD_ZERO(&es);
+
+                // NOTE: select cannot watch descriptors past FD_SETSIZE, which
+                //       caps how many connections MHD can serve here. Linux
+                //       uses epoll and has no such limit.
+                MHD_socket maxfd;
+                if (MHD_get_fdset(daemon, &rs, &ws, &es, &maxfd) == MHD_NO)
+                    throw new MHDException("MHD_get_fdset");
+
+                int msecs = wait_time();
+                timeval tv;
+                tv.tv_sec  = cast(typeof(tv.tv_sec))(msecs / 1000);
+                tv.tv_usec = cast(typeof(tv.tv_usec))((msecs % 1000) * 1000);
+
+                select(cast(int)(maxfd + 1), &rs, &ws, &es, &tv);
+                MHD_run_from_select(daemon, &rs, &ws, &es);
+            }
+        }
+    }
+}
+
+/// TCP Fast Open queue length, MHD's own default.
+enum FASTOPEN_QUEUE = 10;
+
+/// Port an address is bound to.
+ushort addressPort(Address address)
+{
+    import std.conv : to;
+    return to!ushort(address.toPortString());
+}
+
+/// Port a daemon's listening socket is bound to.
+ushort daemonPort(MHD_Daemon *daemon)
+{
+    const(MHD_DaemonInfo) *info = MHD_get_daemon_info(daemon, MHD_DAEMON_INFO_BIND_PORT);
+    if (info == null)
+        throw new MHDException("MHD_get_daemon_info");
+    return info.port;
 }
 
 /// Per-request state for accumulating upload data across MHD callbacks.
@@ -754,11 +993,6 @@ MHD_Result ddhttpd_handler(void *cls,
     size_t *upload_data_size,
     void **ptr)
 {
-    // MHD uses its own thread pool: Register foreign threads with
-    // the D runtime so the GC can scan their stacks and collect
-    // allocations made during request handling.
-    attach_this_thread();
-
     // First call for this request: Initialize connection state.
     // MHD calls the handler multiple times per request: once to signal
     // a new request, then for each chunk of upload data, then a final

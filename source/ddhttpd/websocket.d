@@ -4,7 +4,6 @@ import bindbc.libmicrohttpd;
 import core.atomic : atomicLoad, atomicStore;
 import core.memory : GC;
 import core.thread.osthread : Thread;
-import ddhttpd.thread : attach_this_thread;
 
 /// WebSocket frame opcodes per RFC 6455.
 enum WSOpcode : ubyte
@@ -350,8 +349,9 @@ extern(C) package(ddhttpd) void ws_upgrade_callback(
     MHD_socket sock,
     MHD_UpgradeResponseHandle *urh)
 {
-    attach_this_thread();
-
+    // Called from the event loop thread, so it must not block: hand the socket
+    // to a thread of its own and return.
+    //
     // Copy before returning - extra_in may point into MHD's stack frame.
     ubyte[] extra = extra_in_size > 0
         ? (cast(ubyte*)extra_in)[0 .. extra_in_size].dup

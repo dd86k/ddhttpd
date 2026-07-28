@@ -264,31 +264,32 @@ void testIPv6Binding()
     check(body_ == "v6", text("unexpected body: ", body_));
 }
 
-// MHD threads are attached to the D runtime on their first callback. If they
-// exit while still registered, the next collection hangs waiting for a suspend
-// acknowledgement from a thread that no longer exists.
-void testThreadDetach()
+// Handlers run on the event loop thread, which the library owns. Nothing may
+// be left registered with the runtime after stop(): a thread that exits while
+// still registered hangs the next collection in thread_suspendAll, waiting for
+// a suspend acknowledgement from a thread that no longer exists.
+void testEventLoopThread()
 {
-    writeln("test: MHD threads detach on exit");
+    writeln("test: event loop thread");
 
     import core.memory : GC;
-    import core.thread : Thread, dur;
+    import core.thread : Thread;
 
     size_t before = Thread.getAll().length;
 
-    HTTPServer pooled = new HTTPServer()
+    HTTPServer served = new HTTPServer()
         .addRoute("GET", "/", (ref HTTPRequest req)
         {
-            // Allocate so the GC is exercised from the MHD thread
+            // Allocate so the GC is exercised from the event loop thread
             ubyte[] junk = new ubyte[](64 * 1024);
             junk[0] = 1;
-            req.reply(200, HTTPReply.staticBuffer("pooled"), "text/plain");
+            check(Thread.getThis() !is null, "handler ran on an unregistered thread");
+            req.reply(200, HTTPReply.staticBuffer("served"), "text/plain");
             return REQUEST_OK;
         });
-    pooled.threadPoolSize(4);
-    pooled.start("127.0.0.1", 0);
+    served.start("127.0.0.1", 0);
 
-    string base = text("http://127.0.0.1:", pooled.port(), "/");
+    string base = text("http://127.0.0.1:", served.port(), "/");
     foreach (i; 0 .. 64)
     {
         HTTP http = HTTP(base);
@@ -296,10 +297,13 @@ void testThreadDetach()
         http.perform();
     }
 
-    check(Thread.getAll().length > before, "no MHD thread was attached");
+    // Counted once the loop is definitely running: a thread only joins the
+    // runtime's list when it starts, not when start() returns
+    size_t serving = Thread.getAll().length;
+    check(serving == before + 1,
+        text("expected one event loop thread, got ", cast(long)serving - cast(long)before));
 
-    pooled.stop();
-    Thread.sleep(dur!"msecs"(200)); // MHD joins its workers, TLS destructors run
+    served.stop();
 
     size_t after = Thread.getAll().length;
     check(after == before,
@@ -307,6 +311,106 @@ void testThreadDetach()
 
     // Would deadlock in thread_suspendAll if a dead thread was still listed
     GC.collect();
+}
+
+// A pool serves from several threads at once, all accepting from one shared
+// listening socket.
+void testThreadPool()
+{
+    writeln("test: thread pool");
+
+    import core.thread : Thread, dur;
+    import std.socket : InternetAddress, Socket, TcpSocket;
+
+    enum POOL = 3;
+    shared int[ulong] served; // handler thread -> requests it handled
+    Object lock = new Object;
+
+    size_t before = Thread.getAll().length;
+
+    HTTPServer pooled = new HTTPServer()
+        .addRoute("GET", "/slow", (ref HTTPRequest req)
+        {
+            ulong id = cast(ulong)cast(void*)Thread.getThis();
+            synchronized (lock)
+                (cast(int[ulong])served)[id]++;
+            // Long enough that a single threaded server could not overlap them
+            Thread.sleep(dur!"msecs"(200));
+            req.reply(200, HTTPReply.staticBuffer("slow"), "text/plain");
+            return REQUEST_OK;
+        });
+    pooled.threadPoolSize(POOL);
+    pooled.start("127.0.0.1", 0);
+
+    ushort port = pooled.port();
+    string slowURL = text("http://127.0.0.1:", port, "/slow");
+
+    Thread[] clients;
+    foreach (i; 0 .. POOL)
+    {
+        Thread client = new Thread(()
+        {
+            HTTP http = HTTP(slowURL);
+            http.onReceive = (ubyte[] data) { return data.length; };
+            http.perform();
+        });
+        client.start();
+        clients ~= client;
+    }
+    foreach (Thread client; clients)
+        client.join();
+
+    check(Thread.getAll().length == before + POOL,
+        text("expected ", POOL, " loop threads, got ",
+            cast(long)Thread.getAll().length - cast(long)before));
+
+    size_t distinct = (cast(int[ulong])served).length;
+    check(distinct > 1, text("requests were served by ", distinct, " thread(s)"));
+
+    pooled.stop();
+
+    check(Thread.getAll().length == before,
+        text("expected ", before, " registered threads after stop, got ",
+            Thread.getAll().length));
+
+    // The shared listening socket belongs to us and must be closed by stop(),
+    // MHD would otherwise close it once per daemon
+    Socket probe = new TcpSocket();
+    bool rebound = true;
+    try
+        probe.bind(new InternetAddress("127.0.0.1", port));
+    catch (Exception ex)
+        rebound = false;
+    probe.close();
+    check(rebound, "listening socket still open after stop");
+}
+
+void testPoolSizeValidation()
+{
+    writeln("test: pool size validation");
+
+    bool refused;
+    try
+        new HTTPServer().threadPoolSize(0);
+    catch (Exception ex)
+        refused = true;
+    check(refused, "expected threadPoolSize(0) to throw");
+
+    HTTPServer running = new HTTPServer()
+        .addRoute("GET", "/", (ref HTTPRequest req)
+        {
+            req.reply(200, HTTPReply.staticBuffer("ok"), "text/plain");
+            return REQUEST_OK;
+        });
+    running.start("127.0.0.1", 0);
+    scope(exit) running.stop();
+
+    refused = false;
+    try
+        running.threadPoolSize(2);
+    catch (Exception ex)
+        refused = true;
+    check(refused, "expected threadPoolSize() after start() to throw");
 }
 
 void main()
@@ -359,7 +463,9 @@ void main()
     testUploadLimit();
     testAddressBinding();
     testIPv6Binding();
-    testThreadDetach();
+    testEventLoopThread();
+    testThreadPool();
+    testPoolSizeValidation();
 
     writeln();
     if (failures > 0)
