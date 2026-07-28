@@ -577,6 +577,14 @@ class HTTPServer
             state.listener.close();
             state.listener = null;
         }
+        
+        // Nothing is going to call back into us any more, so let the collector
+        // have the instance again. See startDaemon for why it was pinned.
+        if (state.rooted)
+        {
+            state.rooted = false;
+            GC.removeRoot(cast(void*)this);
+        }
     }
     
     // Start daemon mode
@@ -729,6 +737,20 @@ private:
             dl.thread.isDaemon = true;
             dl.thread.start();
         }
+
+        // Every daemon was handed `&state` as the closure it passes back to
+        // ddhttpd_handler, and MHD holds that pointer in malloc'd memory the
+        // collector never looks at. Nothing else has to keep the server
+        // reachable: the usual shape is `new HTTPServer().get(...).start(...)`
+        // followed by parking the main thread, which leaves no live reference
+        // for the stack scan to find. The instance is then collected and its
+        // block recycled, so the next request reads routes out of whatever
+        // moved in. Pin it here, and let stop() release it.
+        //
+        // Rooting last is deliberate: until this point `this` is live in the
+        // caller, and the scope(failure) above must not have to undo a root.
+        GC.addRoot(cast(void*)this);
+        state.rooted = true;
     }
 
     /// Create the socket a pool of daemons accepts from.
@@ -843,6 +865,9 @@ struct ServerState
     Socket listener;
     ushort bound_port;
     uint pool_size = 1;
+    /// True while the owning HTTPServer is pinned as a GC root, so stop() only
+    /// unpins a start() that got far enough to pin in the first place
+    bool rooted;
 }
 
 /// One MHD daemon and the thread driving it. Handlers run on that thread,
