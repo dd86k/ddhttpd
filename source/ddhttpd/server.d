@@ -4,12 +4,12 @@ import bindbc.libmicrohttpd;
 static if (!bindbc.libmicrohttpd.staticBinding)
     import bindbc.loader;
 import core.memory : GC;
-import core.thread.osthread : Thread, thread_attachThis;
 import std.conv : text;
 import std.encoding;
 import std.socket : Address;
 import std.stdio;
 import std.string : toStringz, fromStringz, indexOf;
+import ddhttpd.thread : attach_this_thread;
 import ddhttpd.websocket : WebSocketConnection, WSUpgradeClosure, ws_upgrade_callback, ws_compute_accept;
 
 /// Printable ddhttpd version
@@ -757,8 +757,7 @@ MHD_Result ddhttpd_handler(void *cls,
     // MHD uses its own thread pool: Register foreign threads with
     // the D runtime so the GC can scan their stacks and collect
     // allocations made during request handling.
-    if (Thread.getThis() is null)
-        thread_attachThis();
+    attach_this_thread();
 
     // First call for this request: Initialize connection state.
     // MHD calls the handler multiple times per request: once to signal

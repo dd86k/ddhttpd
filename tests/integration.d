@@ -264,6 +264,51 @@ void testIPv6Binding()
     check(body_ == "v6", text("unexpected body: ", body_));
 }
 
+// MHD threads are attached to the D runtime on their first callback. If they
+// exit while still registered, the next collection hangs waiting for a suspend
+// acknowledgement from a thread that no longer exists.
+void testThreadDetach()
+{
+    writeln("test: MHD threads detach on exit");
+
+    import core.memory : GC;
+    import core.thread : Thread, dur;
+
+    size_t before = Thread.getAll().length;
+
+    HTTPServer pooled = new HTTPServer()
+        .addRoute("GET", "/", (ref HTTPRequest req)
+        {
+            // Allocate so the GC is exercised from the MHD thread
+            ubyte[] junk = new ubyte[](64 * 1024);
+            junk[0] = 1;
+            req.reply(200, HTTPReply.staticBuffer("pooled"), "text/plain");
+            return REQUEST_OK;
+        });
+    pooled.threadPoolSize(4);
+    pooled.start("127.0.0.1", 0);
+
+    string base = text("http://127.0.0.1:", pooled.port(), "/");
+    foreach (i; 0 .. 64)
+    {
+        HTTP http = HTTP(base);
+        http.onReceive = (ubyte[] data) { return data.length; };
+        http.perform();
+    }
+
+    check(Thread.getAll().length > before, "no MHD thread was attached");
+
+    pooled.stop();
+    Thread.sleep(dur!"msecs"(200)); // MHD joins its workers, TLS destructors run
+
+    size_t after = Thread.getAll().length;
+    check(after == before,
+        text("expected ", before, " registered threads after stop, got ", after));
+
+    // Would deadlock in thread_suspendAll if a dead thread was still listed
+    GC.collect();
+}
+
 void main()
 {
     HTTPServer server = new HTTPServer()
@@ -314,6 +359,7 @@ void main()
     testUploadLimit();
     testAddressBinding();
     testIPv6Binding();
+    testThreadDetach();
 
     writeln();
     if (failures > 0)
